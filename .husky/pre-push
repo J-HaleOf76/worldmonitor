@@ -34,5 +34,25 @@ npm run lint:md || exit 1
 echo "Running MDX lint (Mintlify compatibility)..."
 node --test tests/mdx-lint.test.mjs || exit 1
 
+echo "Running proto freshness check..."
+if command -v buf >/dev/null 2>&1 || [ -x "$HOME/go/bin/buf" ]; then
+  export PATH="$HOME/go/bin:$PATH"
+  PROTO_HASH_BEFORE=$(find src/generated -name "*.ts" -exec md5 -q {} \; 2>/dev/null | sort | md5 -q 2>/dev/null || echo "skip")
+  if [ "$PROTO_HASH_BEFORE" != "skip" ]; then
+    make generate >/dev/null 2>&1
+    PROTO_HASH_AFTER=$(find src/generated -name "*.ts" -exec md5 -q {} \; | sort | md5 -q)
+    if [ "$PROTO_HASH_BEFORE" != "$PROTO_HASH_AFTER" ]; then
+      echo "============================================================"
+      echo "ERROR: Proto-generated code is out of date."
+      echo "Run 'make generate' locally and commit the updated files."
+      echo "============================================================"
+      git checkout -- src/generated/ docs/api/ 2>/dev/null
+      exit 1
+    fi
+  fi
+else
+  echo "  (skipped: buf not installed, run 'make install-plugins' to enable)"
+fi
+
 echo "Running version sync check..."
 npm run version:check || exit 1
