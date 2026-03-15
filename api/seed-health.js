@@ -35,7 +35,7 @@ const SEED_DOMAINS = {
   'intelligence:satellites':  { key: 'seed-meta:intelligence:satellites',  intervalMin: 90 },
   'military:flights':         { key: 'seed-meta:military:flights',         intervalMin: 8 },
   'infra:service-statuses':   { key: 'seed-meta:infra:service-statuses',   intervalMin: 60 },
-  'supply_chain:shipping':    { key: 'seed-meta:supply_chain:shipping',    intervalMin: 120 },
+  'supply_chain:shipping':    { key: 'seed-meta:supply_chain:shipping',    intervalMin: 720 },
   'supply_chain:chokepoints': { key: 'seed-meta:supply_chain:chokepoints', intervalMin: 30 },
   'cable-health':             { key: 'seed-meta:cable-health',             intervalMin: 30 },
   'prediction:markets':       { key: 'seed-meta:prediction:markets',       intervalMin: 8 },

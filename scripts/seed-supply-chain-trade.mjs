@@ -12,8 +12,8 @@ const KEYS = {
   customsRevenue: 'trade:customs-revenue:v1',
 };
 
-const SHIPPING_TTL = 3600;
-const TRADE_TTL = 21600;
+const SHIPPING_TTL = 43200;
+const TRADE_TTL = 86400;
 
 const MAJOR_REPORTERS = ['840', '156', '276', '392', '826', '356', '076', '643', '410', '036', '124', '484', '250', '380', '528'];
 

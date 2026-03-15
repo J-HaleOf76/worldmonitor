@@ -94,7 +94,7 @@ const SEED_META = {
   bisPolicy:        { key: 'seed-meta:economic:bis:policy',       maxStaleMin: 2880 },
   bisExchange:      { key: 'seed-meta:economic:bis:eer',          maxStaleMin: 2880 },
   bisCredit:        { key: 'seed-meta:economic:bis:credit',       maxStaleMin: 2880 },
-  shippingRates:    { key: 'seed-meta:supply_chain:shipping',     maxStaleMin: 420 },
+  shippingRates:    { key: 'seed-meta:supply_chain:shipping',     maxStaleMin: 1440 },
   chokepoints:      { key: 'seed-meta:supply_chain:chokepoints',  maxStaleMin: 60 },
   minerals:         { key: 'seed-meta:supply_chain:minerals',     maxStaleMin: 10080 },
   giving:           { key: 'seed-meta:giving:summary',            maxStaleMin: 10080 },
