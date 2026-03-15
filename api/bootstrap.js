@@ -46,6 +46,7 @@ const BOOTSTRAP_CACHE_KEYS = {
   gdeltIntel:        'intelligence:gdelt-intel:v1',
   correlationCards:   'correlation:cards-bootstrap:v1',
   forecasts:         'forecast:predictions:v2',
+  securityAdvisories: 'intelligence:advisories-bootstrap:v1',
 };
 
 const SLOW_KEYS = new Set([
@@ -55,6 +56,7 @@ const SLOW_KEYS = new Set([
   'naturalEvents',
   'cryptoQuotes', 'gulfQuotes', 'stablecoinMarkets', 'unrestEvents', 'ucdpEvents',
   'techEvents',
+  'securityAdvisories',
 ]);
 const FAST_KEYS = new Set([
   'earthquakes', 'outages', 'serviceStatuses', 'macroSignals', 'chokepoints', 'chokepointTransits',

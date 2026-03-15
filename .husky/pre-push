@@ -35,22 +35,37 @@ echo "Running MDX lint (Mintlify compatibility)..."
 node --test tests/mdx-lint.test.mjs || exit 1
 
 echo "Running proto freshness check..."
-if command -v buf >/dev/null 2>&1 || [ -x "$HOME/go/bin/buf" ]; then
-  export PATH="$HOME/go/bin:$PATH"
-  PROTO_HASH_BEFORE=$(find src/generated -name "*.ts" -exec md5 -q {} \; 2>/dev/null | sort | md5 -q 2>/dev/null || echo "skip")
-  if [ "$PROTO_HASH_BEFORE" != "skip" ]; then
-    make generate >/dev/null 2>&1
-    PROTO_HASH_AFTER=$(find src/generated -name "*.ts" -exec md5 -q {} \; | sort | md5 -q)
-    if [ "$PROTO_HASH_BEFORE" != "$PROTO_HASH_AFTER" ]; then
+if git diff --name-only origin/main -- proto/ src/generated/ docs/api/ Makefile | grep -q .; then
+  if command -v buf >/dev/null 2>&1 || [ -x "$HOME/go/bin/buf" ]; then
+    export PATH="$HOME/go/bin:$PATH"
+  fi
+  if command -v buf &>/dev/null && command -v protoc-gen-ts-client &>/dev/null; then
+    make generate
+    if ! git diff --exit-code src/generated/ docs/api/; then
+      echo ""
       echo "============================================================"
       echo "ERROR: Proto-generated code is out of date."
       echo "Run 'make generate' locally and commit the updated files."
       echo "============================================================"
       exit 1
     fi
+    UNTRACKED=$(git ls-files --others --exclude-standard src/generated/ docs/api/)
+    if [ -n "$UNTRACKED" ]; then
+      echo ""
+      echo "============================================================"
+      echo "ERROR: Untracked generated files found:"
+      echo "$UNTRACKED"
+      echo "Run 'make generate' locally and commit the new files."
+      echo "============================================================"
+      exit 1
+    fi
+    echo "Proto-generated code is up to date."
+  else
+    echo "WARNING: buf or protoc plugins not installed, skipping proto freshness check."
+    echo "  Install with: make install-buf install-plugins"
   fi
 else
-  echo "  (skipped: buf not installed, run 'make install-plugins' to enable)"
+  echo "No proto-related changes, skipping."
 fi
 
 echo "Running version sync check..."

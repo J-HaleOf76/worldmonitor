@@ -149,7 +149,7 @@ import {
   shouldRefreshDailyBrief,
 } from '@/services/daily-market-brief';
 import { fetchCachedRiskScores } from '@/services/cached-risk-scores';
-import type { ThreatLevel as ClientThreatLevel } from '@/services/threat-classifier';
+import type { ThreatLevel as ClientThreatLevel } from '@/types';
 import type { NewsItem as ProtoNewsItem, ThreatLevel as ProtoThreatLevel } from '@/generated/client/worldmonitor/news/v1/service_client';
 
 const PROTO_TO_CLIENT_LEVEL: Record<ProtoThreatLevel, ClientThreatLevel> = {
@@ -1370,7 +1370,6 @@ export class DataLoaderManager implements AppModule {
         this.callPanel('forecast', 'updateForecasts', hydrated.predictions);
         return;
       }
-
       const { fetchForecasts } = await import('@/services/forecast');
       const forecasts = await fetchForecasts();
       this.callPanel('forecast', 'updateForecasts', forecasts);
