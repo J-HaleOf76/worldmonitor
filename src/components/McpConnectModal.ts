@@ -164,7 +164,7 @@ export function openMcpConnectModal(options: McpConnectOptions): void {
     const trimmed = raw.trim();
     if (!trimmed) return {};
     const result: Record<string, string> = {};
-    for (const part of trimmed.split(/;\s+(?=[^:]+:)/)) {
+    for (const part of trimmed.split(/;\s+(?=[A-Za-z0-9_-]+\s*:)/)) {
       const colon = part.indexOf(':');
       if (colon === -1) continue;
       const key = part.slice(0, colon).trim();
