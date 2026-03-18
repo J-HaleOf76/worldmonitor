@@ -194,26 +194,31 @@ function emptySignals(): CountrySignals {
 
 async function fetchACLEDEvents(): Promise<Array<{ country: string; event_type: string; fatalities: number; daysAgo: number }>> {
   const now = Date.now();
-  const endDate = new Date(now).toISOString().split('T')[0]!;
-  // 30-day window: recent events (0-7d) weighted 1.0, older (8-30d) weighted 0.4
-  // This captures post-ceasefire/post-conflict signals that disappear from 7d windows
-  const startDate = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
-  const raw = await fetchAcledCached({
-    eventTypes: 'Protests|Riots|Battles|Explosions/Remote violence|Violence against civilians',
-    startDate,
-    endDate,
-    limit: 1500,
-  });
-  return raw.map((e) => {
+  const today = new Date(now).toISOString().split('T')[0]!;
+  const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
+  const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]!;
+  const eventTypes = 'Protests|Riots|Battles|Explosions/Remote violence|Violence against civilians';
+
+  // Two separate cached queries so each window has its own 1 000-event budget.
+  // A single 30-day request at limit:1500 silently drops tail events once the
+  // global count exceeds the cap; splitting ensures post-conflict countries
+  // (low recent activity, higher older activity) are not squeezed out.
+  const [recent, older] = await Promise.all([
+    fetchAcledCached({ eventTypes, startDate: sevenDaysAgo, endDate: today, limit: 1000 }),
+    fetchAcledCached({ eventTypes, startDate: thirtyDaysAgo, endDate: sevenDaysAgo, limit: 1000 }),
+  ]);
+
+  const toRow = (e: (typeof recent)[number]) => {
     const eventMs = e.event_date ? new Date(e.event_date).getTime() : now;
-    const daysAgo = Math.max(0, Math.floor((now - eventMs) / (24 * 60 * 60 * 1000)));
     return {
       country: e.country || '',
       event_type: e.event_type || '',
       fatalities: parseInt(e.fatalities || '0', 10) || 0,
-      daysAgo,
+      daysAgo: Math.max(0, Math.floor((now - eventMs) / (24 * 60 * 60 * 1000))),
     };
-  });
+  };
+
+  return [...recent.map(toRow), ...older.map(toRow)];
 }
 
 interface AuxiliarySources {
@@ -459,12 +464,13 @@ export function computeCIIScores(
       ? (d.orefAlertCount > 0 ? 15 : 0) + (d.orefHistoryCount24h >= 10 ? 10 : d.orefHistoryCount24h >= 3 ? 5 : 0)
       : 0;
 
-    // --- Displacement boost (UNHCR data — captures post-conflict destruction ---
-    // that ACLED misses after ceasefires). Log-scale so small numbers don't
-    // distort and large crises (Lebanon ~1M, Syria ~7M) get appropriate weight.
-    // 100K displaced → ~4pts | 500K → ~9pts | 1M → ~12pts | 5M → ~18pts | 10M → ~20pts
+    // --- Displacement boost (UNHCR — persists after ceasefires) ---
+    // Ramp anchored so the scale spans meaningful crisis sizes:
+    //   100K  → +4  |  500K → +9  |  1M → +12  |  5M → +18  |  10M+ → +20
+    // Formula: (log10(n) - 5) * 8 + 4, clamped [0, 20].
+    // Below ~32K displaced → 0; cap reached at 10M.
     const displacementBoost = d.totalDisplaced > 0
-      ? Math.min(20, Math.floor(Math.log10(d.totalDisplaced) * 4))
+      ? Math.min(20, Math.max(0, Math.round((Math.log10(d.totalDisplaced) - 5) * 8 + 4)))
       : 0;
 
     const blended = baseline * 0.4
