@@ -20,6 +20,8 @@ const TRACE_LATEST_KEY = 'forecast:trace:latest:v1';
 const TRACE_RUNS_KEY = 'forecast:trace:runs:v1';
 const TRACE_RUNS_MAX = 50;
 const TRACE_REDIS_TTL_SECONDS = 60 * 24 * 60 * 60;
+const WORLD_STATE_HISTORY_LIMIT = 6;
+const FORECAST_REFRESH_REQUEST_KEY = 'forecast:refresh-request:v1';
 const PUBLISH_MIN_PROBABILITY = 0;
 const PANEL_MIN_PROBABILITY = 0.1;
 const ENRICHMENT_COMBINED_MAX = 3;
@@ -137,6 +139,13 @@ function getRedisCredentials() {
   return { url, token };
 }
 
+function getDeployRevision() {
+  return process.env.RAILWAY_GIT_COMMIT_SHA
+    || process.env.VERCEL_GIT_COMMIT_SHA
+    || process.env.GITHUB_SHA
+    || '';
+}
+
 async function redisCommand(url, token, command) {
   const resp = await fetch(url, {
     method: 'POST',
@@ -160,6 +169,10 @@ async function redisGet(url, token, key) {
   const data = await resp.json();
   if (!data?.result) return null;
   try { return JSON.parse(data.result); } catch { return null; }
+}
+
+async function redisDel(url, token, key) {
+  return redisCommand(url, token, ['DEL', key]);
 }
 
 // ── Phase 4: Input normalizers ──────────────────────────────
@@ -2235,6 +2248,372 @@ function buildBranchContinuitySummary(currentBranchStates, priorWorldState = nul
   };
 }
 
+function uniqueSortedStrings(values) {
+  return Array.from(new Set((values || []).filter(Boolean).map((value) => String(value)))).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeSituationText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token && token.length > 2 && !TEXT_STOPWORDS.has(token));
+}
+
+function hashSituationKey(parts) {
+  return crypto.createHash('sha256').update(parts.filter(Boolean).join('|')).digest('hex').slice(0, 10);
+}
+
+function buildSituationCandidate(prediction) {
+  return {
+    prediction,
+    regions: uniqueSortedStrings([prediction.region, ...(prediction.caseFile?.regions || [])]),
+    domains: uniqueSortedStrings([prediction.domain, ...(prediction.caseFile?.domains || [])]),
+    actors: uniqueSortedStrings((prediction.caseFile?.actors || []).map((actor) => actor.id || actor.name).filter(Boolean)),
+    branchKinds: uniqueSortedStrings((prediction.caseFile?.branches || []).map((branch) => branch.kind).filter(Boolean)),
+    tokens: uniqueSortedStrings([
+      ...normalizeSituationText(prediction.title),
+      ...normalizeSituationText(prediction.feedSummary),
+      ...(prediction.signals || []).flatMap((signal) => normalizeSituationText(signal?.value)),
+      ...(prediction.newsContext || []).flatMap((headline) => normalizeSituationText(headline)),
+    ]).slice(0, 24),
+  };
+}
+
+function computeSituationOverlap(candidate, cluster) {
+  const overlapCount = (left, right) => left.filter((item) => right.includes(item)).length;
+  return (
+    overlapCount(candidate.regions, cluster.regions) * 3 +
+    overlapCount(candidate.actors, cluster.actors) * 2 +
+    overlapCount(candidate.domains, cluster.domains) * 1.5 +
+    overlapCount(candidate.branchKinds, cluster.branchKinds) * 1 +
+    overlapCount(candidate.tokens, cluster.tokens) * 0.25
+  );
+}
+
+function finalizeSituationCluster(cluster) {
+  const avgProbability = cluster._probabilityTotal / Math.max(1, cluster.forecastCount);
+  const avgConfidence = cluster._confidenceTotal / Math.max(1, cluster.forecastCount);
+  const topSignals = Object.entries(cluster._signalCounts)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 6)
+    .map(([type, count]) => ({ type, count }));
+  const stableKey = [
+    ...cluster.regions.slice(0, 2),
+    ...cluster.actors.slice(0, 2),
+    ...cluster.domains.slice(0, 2),
+  ];
+  const leadRegion = cluster.regions[0] || 'Cross-regional';
+  const leadDomain = cluster.domains[0] || 'multi-domain';
+  const leadActor = cluster.actors[0] || '';
+
+  return {
+    id: `sit-${hashSituationKey(stableKey)}`,
+    stableKey,
+    label: leadActor ? `${leadRegion}: ${leadActor} ${leadDomain} pressure` : `${leadRegion}: ${leadDomain} pressure`,
+    forecastCount: cluster.forecastCount,
+    forecastIds: cluster.forecastIds.slice(0, 12),
+    regions: cluster.regions,
+    domains: cluster.domains,
+    actors: cluster.actors,
+    branchKinds: cluster.branchKinds,
+    avgProbability: +avgProbability.toFixed(3),
+    avgConfidence: +avgConfidence.toFixed(3),
+    topSignals,
+    sampleTitles: cluster.sampleTitles.slice(0, 6),
+  };
+}
+
+function computeSituationSimilarity(currentCluster, priorCluster) {
+  const overlapCount = (left, right) => left.filter((item) => right.includes(item)).length;
+  return (
+    overlapCount(currentCluster.regions || [], priorCluster.regions || []) * 3 +
+    overlapCount(currentCluster.actors || [], priorCluster.actors || []) * 2 +
+    overlapCount(currentCluster.domains || [], priorCluster.domains || []) * 1.5 +
+    overlapCount(currentCluster.branchKinds || [], priorCluster.branchKinds || []) * 1 +
+    overlapCount(currentCluster.forecastIds || [], priorCluster.forecastIds || []) * 0.5
+  );
+}
+function buildSituationClusters(predictions) {
+  const clusters = [];
+
+  for (const prediction of predictions) {
+    const candidate = buildSituationCandidate(prediction);
+    let bestCluster = null;
+    let bestScore = 0;
+
+    for (const cluster of clusters) {
+      const score = computeSituationOverlap(candidate, cluster);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCluster = cluster;
+      }
+    }
+
+    if (!bestCluster || bestScore < 3) {
+      bestCluster = {
+        regions: [],
+        domains: [],
+        actors: [],
+        branchKinds: [],
+        tokens: [],
+        forecastIds: [],
+        sampleTitles: [],
+        forecastCount: 0,
+        _probabilityTotal: 0,
+        _confidenceTotal: 0,
+        _signalCounts: {},
+      };
+      clusters.push(bestCluster);
+    }
+
+    bestCluster.regions = uniqueSortedStrings([...bestCluster.regions, ...candidate.regions]);
+    bestCluster.domains = uniqueSortedStrings([...bestCluster.domains, ...candidate.domains]);
+    bestCluster.actors = uniqueSortedStrings([...bestCluster.actors, ...candidate.actors]);
+    bestCluster.branchKinds = uniqueSortedStrings([...bestCluster.branchKinds, ...candidate.branchKinds]);
+    bestCluster.tokens = uniqueSortedStrings([...bestCluster.tokens, ...candidate.tokens]).slice(0, 28);
+    bestCluster.forecastIds.push(prediction.id);
+    bestCluster.sampleTitles.push(prediction.title);
+    bestCluster.forecastCount += 1;
+    bestCluster._probabilityTotal += Number(prediction.probability || 0);
+    bestCluster._confidenceTotal += Number(prediction.confidence || 0);
+
+    for (const signal of prediction.signals || []) {
+      const type = signal?.type || 'unknown';
+      bestCluster._signalCounts[type] = (bestCluster._signalCounts[type] || 0) + 1;
+    }
+  }
+
+  return clusters
+    .map(finalizeSituationCluster)
+    .sort((a, b) => b.forecastCount - a.forecastCount || b.avgProbability - a.avgProbability);
+}
+
+function buildSituationContinuitySummary(currentSituationClusters, priorWorldState = null) {
+  const priorSituationClusters = Array.isArray(priorWorldState?.situationClusters) ? priorWorldState.situationClusters : [];
+  const matchedPriorIds = new Set();
+  const persistent = [];
+  const newlyActive = [];
+  const strengthened = [];
+  const weakened = [];
+
+  for (const cluster of currentSituationClusters) {
+    let prev = priorSituationClusters.find((item) => item.id === cluster.id);
+    if (!prev) {
+      let bestMatch = null;
+      let bestScore = 0;
+      for (const priorCluster of priorSituationClusters) {
+        if (matchedPriorIds.has(priorCluster.id)) continue;
+        const score = computeSituationSimilarity(cluster, priorCluster);
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = priorCluster;
+        }
+      }
+      if (bestMatch && bestScore >= 4) prev = bestMatch;
+    }
+    if (!prev) {
+      newlyActive.push(cluster);
+      continue;
+    }
+
+    matchedPriorIds.add(prev.id);
+    persistent.push(cluster);
+    const probabilityDelta = +((cluster.avgProbability || 0) - (prev.avgProbability || 0)).toFixed(3);
+    const countDelta = cluster.forecastCount - (prev.forecastCount || 0);
+    const addedActors = cluster.actors.filter((actor) => !(prev.actors || []).includes(actor));
+    const addedRegions = cluster.regions.filter((region) => !(prev.regions || []).includes(region));
+
+    const record = {
+      id: cluster.id,
+      label: cluster.label,
+      forecastCount: cluster.forecastCount,
+      priorForecastCount: prev.forecastCount || 0,
+      avgProbability: cluster.avgProbability,
+      priorAvgProbability: +(prev.avgProbability || 0).toFixed(3),
+      probabilityDelta,
+      countDelta,
+      addedActors: addedActors.slice(0, 4),
+      addedRegions: addedRegions.slice(0, 4),
+    };
+
+    if (probabilityDelta >= 0.08 || countDelta >= 2 || addedActors.length > 0 || addedRegions.length > 0) {
+      strengthened.push(record);
+    } else if (probabilityDelta <= -0.08 || countDelta <= -2) {
+      weakened.push(record);
+    }
+  }
+
+  const resolved = priorSituationClusters
+    .filter((cluster) => !matchedPriorIds.has(cluster.id))
+    .map((cluster) => ({
+      id: cluster.id,
+      label: cluster.label,
+      forecastCount: cluster.forecastCount || 0,
+      avgProbability: +(cluster.avgProbability || 0).toFixed(3),
+    }));
+
+  return {
+    priorSituationCount: priorSituationClusters.length,
+    currentSituationCount: currentSituationClusters.length,
+    persistentSituationCount: persistent.length,
+    newSituationCount: newlyActive.length,
+    strengthenedSituationCount: strengthened.length,
+    weakenedSituationCount: weakened.length,
+    resolvedSituationCount: resolved.length,
+    newSituationPreview: newlyActive.slice(0, 8),
+    strengthenedSituationPreview: strengthened
+      .sort((a, b) => b.probabilityDelta - a.probabilityDelta || b.countDelta - a.countDelta || a.id.localeCompare(b.id))
+      .slice(0, 8),
+    weakenedSituationPreview: weakened
+      .sort((a, b) => a.probabilityDelta - b.probabilityDelta || a.countDelta - b.countDelta || a.id.localeCompare(b.id))
+      .slice(0, 8),
+    resolvedSituationPreview: resolved.slice(0, 8),
+  };
+}
+
+function buildSituationSummary(situationClusters, situationContinuity) {
+  const leading = situationClusters.slice(0, 4).map((cluster) => ({
+    id: cluster.id,
+    label: cluster.label,
+    forecastCount: cluster.forecastCount,
+    avgProbability: cluster.avgProbability,
+    regions: cluster.regions,
+    domains: cluster.domains,
+  }));
+
+  return {
+    summary: situationClusters.length
+      ? `${situationClusters.length} clustered situations are active, led by ${leading.map((cluster) => cluster.label).join(', ')}.`
+      : 'No clustered situations are active in this run.',
+    continuitySummary: `Situations: ${situationContinuity.newSituationCount} new, ${situationContinuity.strengthenedSituationCount} strengthened, ${situationContinuity.resolvedSituationCount} resolved.`,
+    leading,
+  };
+}
+
+function summarizeWorldStateHistory(priorWorldStates = []) {
+  return priorWorldStates
+    .filter(Boolean)
+    .slice(0, WORLD_STATE_HISTORY_LIMIT)
+    .map((state) => ({
+      generatedAt: state.generatedAt,
+      generatedAtIso: state.generatedAtIso,
+      summary: state.summary,
+      domainCount: Array.isArray(state.domainStates) ? state.domainStates.length : 0,
+      regionCount: Array.isArray(state.regionalStates) ? state.regionalStates.length : 0,
+      situationCount: Array.isArray(state.situationClusters) ? state.situationClusters.length : 0,
+      actorCount: Array.isArray(state.actorRegistry) ? state.actorRegistry.length : 0,
+      branchCount: Array.isArray(state.branchStates) ? state.branchStates.length : 0,
+    }));
+}
+
+function buildReportContinuity(current, priorWorldStates = []) {
+  const history = summarizeWorldStateHistory(priorWorldStates);
+
+  const persistentPressures = [];
+  const emergingPressures = [];
+  const fadingPressures = [];
+  const repeatedStrengthening = [];
+  const matchedLatestPriorIds = new Set();
+
+  for (const cluster of current.situationClusters || []) {
+    const priorMatches = [];
+    for (const state of priorWorldStates.filter(Boolean)) {
+      const candidates = Array.isArray(state.situationClusters) ? state.situationClusters : [];
+      let match = candidates.find((item) => item.id === cluster.id) || null;
+      if (!match) {
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const candidate of candidates) {
+          const score = computeSituationSimilarity(cluster, candidate);
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = candidate;
+          }
+        }
+        if (bestMatch && bestScore >= 4) match = bestMatch;
+      }
+      if (!match) continue;
+      priorMatches.push({
+        id: match.id,
+        label: match.label,
+        generatedAt: state.generatedAt || 0,
+        avgProbability: Number(match.avgProbability || 0),
+        forecastCount: Number(match.forecastCount || 0),
+      });
+      if (state === priorWorldStates[0]) matchedLatestPriorIds.add(match.id);
+    }
+
+    if (priorMatches.length === 0) {
+      emergingPressures.push({
+        id: cluster.id,
+        label: cluster.label,
+        forecastCount: cluster.forecastCount,
+        avgProbability: cluster.avgProbability,
+      });
+      continue;
+    }
+
+    persistentPressures.push({
+      id: cluster.id,
+      label: cluster.label,
+      appearances: priorMatches.length + 1,
+      forecastCount: cluster.forecastCount,
+      avgProbability: cluster.avgProbability,
+    });
+
+    // priorMatches is ordered most-recent-first (mirrors priorWorldStates order from LRANGE)
+    const lastMatch = priorMatches[0];
+    const earliestMatch = priorMatches[priorMatches.length - 1];
+    // "strengthening" means current is >= both the most-recent and oldest prior snapshots,
+    // catching recoveries (V-shapes) as well as monotonic increases intentionally
+    if (
+      cluster.avgProbability >= (lastMatch?.avgProbability || 0) &&
+      cluster.avgProbability >= (earliestMatch?.avgProbability || 0) &&
+      cluster.forecastCount >= (lastMatch?.forecastCount || 0)
+    ) {
+      repeatedStrengthening.push({
+        id: cluster.id,
+        label: cluster.label,
+        avgProbability: cluster.avgProbability,
+        priorAvgProbability: lastMatch?.avgProbability || 0,
+        appearances: priorMatches.length + 1,
+      });
+    }
+  }
+
+  const latestPriorState = priorWorldStates[0] || null;
+  for (const cluster of latestPriorState?.situationClusters || []) {
+    if (matchedLatestPriorIds.has(cluster.id)) continue;
+    fadingPressures.push({
+      id: cluster.id,
+      label: cluster.label,
+      forecastCount: cluster.forecastCount || 0,
+      avgProbability: cluster.avgProbability || 0,
+    });
+  }
+
+  const summary = history.length
+    ? `Across the last ${history.length + 1} runs, ${persistentPressures.length} situations persisted, ${emergingPressures.length} emerged, and ${fadingPressures.length} faded from the latest prior snapshot.`
+    : 'No prior world-state history is available yet for report continuity.';
+
+  return {
+    history,
+    summary,
+    persistentPressureCount: persistentPressures.length,
+    emergingPressureCount: emergingPressures.length,
+    fadingPressureCount: fadingPressures.length,
+    repeatedStrengtheningCount: repeatedStrengthening.length,
+    persistentPressurePreview: persistentPressures.slice(0, 8),
+    emergingPressurePreview: emergingPressures.slice(0, 8),
+    fadingPressurePreview: fadingPressures.slice(0, 8),
+    repeatedStrengtheningPreview: repeatedStrengthening
+      .sort((a, b) => b.appearances - a.appearances || b.avgProbability - a.avgProbability || a.id.localeCompare(b.id))
+      .slice(0, 8),
+  };
+}
+
 function buildWorldStateReport(worldState) {
   const leadDomains = (worldState.domainStates || [])
     .slice(0, 3)
@@ -2278,9 +2657,45 @@ function buildWorldStateReport(worldState) {
     })),
   ].slice(0, 6);
 
-  const continuitySummary = `Actors: ${worldState.actorContinuity?.newlyActiveCount || 0} new, ${worldState.actorContinuity?.strengthenedCount || 0} strengthened. Branches: ${worldState.branchContinuity?.newBranchCount || 0} new, ${worldState.branchContinuity?.strengthenedBranchCount || 0} strengthened, ${worldState.branchContinuity?.resolvedBranchCount || 0} resolved.`;
+  const situationWatchlist = [
+    ...(worldState.situationContinuity?.strengthenedSituationPreview || []).map((situation) => ({
+      type: 'strengthened_situation',
+      label: situation.label,
+      summary: `${situation.label} strengthened from ${roundPct(situation.priorAvgProbability)} to ${roundPct(situation.avgProbability)} across ${situation.forecastCount} forecasts.`,
+    })),
+    ...(worldState.situationContinuity?.newSituationPreview || []).map((situation) => ({
+      type: 'new_situation',
+      label: situation.label,
+      summary: `${situation.label} is newly active across ${situation.forecastCount} forecasts.`,
+    })),
+    ...(worldState.situationContinuity?.resolvedSituationPreview || []).map((situation) => ({
+      type: 'resolved_situation',
+      label: situation.label,
+      summary: `${situation.label} is no longer active in the current run.`,
+    })),
+  ].slice(0, 6);
 
-  const summary = `${worldState.summary} The leading domains in this run are ${leadDomains.join(', ') || 'none'}, and the main continuity changes are captured through ${worldState.actorContinuity?.newlyActiveCount || 0} newly active actors and ${worldState.branchContinuity?.strengthenedBranchCount || 0} strengthened branches.`;
+  const continuityWatchlist = [
+    ...(worldState.reportContinuity?.repeatedStrengtheningPreview || []).map((situation) => ({
+      type: 'persistent_strengthening',
+      label: situation.label,
+      summary: `${situation.label} has strengthened across ${situation.appearances} runs, from ${roundPct(situation.priorAvgProbability)} to ${roundPct(situation.avgProbability)}.`,
+    })),
+    ...(worldState.reportContinuity?.emergingPressurePreview || []).map((situation) => ({
+      type: 'emerging_pressure',
+      label: situation.label,
+      summary: `${situation.label} is a newly emerging situation in the current run.`,
+    })),
+    ...(worldState.reportContinuity?.fadingPressurePreview || []).map((situation) => ({
+      type: 'fading_pressure',
+      label: situation.label,
+      summary: `${situation.label} has faded versus the latest prior world-state snapshot.`,
+    })),
+  ].slice(0, 6);
+
+  const continuitySummary = `Actors: ${worldState.actorContinuity?.newlyActiveCount || 0} new, ${worldState.actorContinuity?.strengthenedCount || 0} strengthened. Branches: ${worldState.branchContinuity?.newBranchCount || 0} new, ${worldState.branchContinuity?.strengthenedBranchCount || 0} strengthened, ${worldState.branchContinuity?.resolvedBranchCount || 0} resolved. Situations: ${worldState.situationContinuity?.newSituationCount || 0} new, ${worldState.situationContinuity?.strengthenedSituationCount || 0} strengthened, ${worldState.situationContinuity?.resolvedSituationCount || 0} resolved.`;
+
+  const summary = `${worldState.summary} The leading domains in this run are ${leadDomains.join(', ') || 'none'}, the main continuity changes are captured through ${worldState.actorContinuity?.newlyActiveCount || 0} newly active actors and ${worldState.branchContinuity?.strengthenedBranchCount || 0} strengthened branches, and the situation layer currently carries ${worldState.situationClusters?.length || 0} active clusters.`;
 
   return {
     summary,
@@ -2293,6 +2708,8 @@ function buildWorldStateReport(worldState) {
     regionalHotspots: leadRegions,
     actorWatchlist,
     branchWatchlist,
+    situationWatchlist,
+    continuityWatchlist,
     keyUncertainties: (worldState.uncertainties || []).slice(0, 6).map(item => item.summary || item),
   };
 }
@@ -2457,10 +2874,16 @@ function buildForecastRunWorldState(data) {
   const actorContinuity = buildActorContinuitySummary(actorRegistry, priorWorldState);
   const branchStates = buildForecastBranchStates(predictions);
   const branchContinuity = buildBranchContinuitySummary(branchStates, priorWorldState);
+  const situationClusters = buildSituationClusters(predictions);
+  const situationContinuity = buildSituationContinuitySummary(situationClusters, priorWorldState);
+  const situationSummary = buildSituationSummary(situationClusters, situationContinuity);
+  const reportContinuity = buildReportContinuity({
+    situationClusters,
+  }, data?.priorWorldStates || []);
   const continuity = buildForecastRunContinuity(predictions);
   const evidenceLedger = buildForecastEvidenceLedger(predictions);
   const activeDomains = domainStates.filter((item) => item.forecastCount > 0).map((item) => item.domain);
-  const summary = `${predictions.length} active forecasts are spanning ${activeDomains.length} domains and ${regionalStates.length} key regions in this run, with ${continuity.newForecasts} new forecasts, ${continuity.materiallyChanged.length} materially changed paths, ${actorContinuity.newlyActiveCount} newly active actors, and ${branchContinuity.strengthenedBranchCount} strengthened branches.`;
+  const summary = `${predictions.length} active forecasts are spanning ${activeDomains.length} domains, ${regionalStates.length} key regions, and ${situationClusters.length} clustered situations in this run, with ${continuity.newForecasts} new forecasts, ${continuity.materiallyChanged.length} materially changed paths, ${actorContinuity.newlyActiveCount} newly active actors, and ${branchContinuity.strengthenedBranchCount} strengthened branches.`;
   const worldState = {
     version: 1,
     generatedAt,
@@ -2472,6 +2895,10 @@ function buildForecastRunWorldState(data) {
     actorContinuity,
     branchStates,
     branchContinuity,
+    situationClusters,
+    situationContinuity,
+    situationSummary,
+    reportContinuity,
     continuity,
     evidenceLedger,
     uncertainties: evidenceLedger.counter.slice(0, 10),
@@ -2585,6 +3012,7 @@ function buildForecastTraceArtifacts(data, context = {}, config = {}) {
     generatedAt,
     predictions,
     priorWorldState: data?.priorWorldState || null,
+    priorWorldStates: data?.priorWorldStates || [],
   });
   const prefix = buildTraceRunPrefix(
     context.runId || `run_${generatedAt}`,
@@ -2608,6 +3036,7 @@ function buildForecastTraceArtifacts(data, context = {}, config = {}) {
     canonicalKey: CANONICAL_KEY,
     forecastCount: predictions.length,
     tracedForecastCount: tracedPredictions.length,
+    triggerContext: data?.triggerContext || null,
     manifestKey,
     summaryKey,
     worldStateKey,
@@ -2620,12 +3049,25 @@ function buildForecastTraceArtifacts(data, context = {}, config = {}) {
     generatedAtIso: manifest.generatedAtIso,
     forecastCount: manifest.forecastCount,
     tracedForecastCount: manifest.tracedForecastCount,
+    triggerContext: manifest.triggerContext,
     quality,
     worldStateSummary: {
       summary: worldState.summary,
       reportSummary: worldState.report?.summary || '',
+      reportContinuitySummary: worldState.reportContinuity?.summary || '',
       domainCount: worldState.domainStates.length,
       regionCount: worldState.regionalStates.length,
+      situationCount: worldState.situationClusters.length,
+      persistentSituations: worldState.situationContinuity.persistentSituationCount,
+      newSituations: worldState.situationContinuity.newSituationCount,
+      strengthenedSituations: worldState.situationContinuity.strengthenedSituationCount,
+      weakenedSituations: worldState.situationContinuity.weakenedSituationCount,
+      resolvedSituations: worldState.situationContinuity.resolvedSituationCount,
+      historyRuns: worldState.reportContinuity?.history?.length || 0,
+      persistentPressures: worldState.reportContinuity?.persistentPressureCount || 0,
+      emergingPressures: worldState.reportContinuity?.emergingPressureCount || 0,
+      fadingPressures: worldState.reportContinuity?.fadingPressureCount || 0,
+      repeatedStrengthening: worldState.reportContinuity?.repeatedStrengtheningCount || 0,
       actorCount: worldState.actorRegistry.length,
       persistentActorCount: worldState.actorContinuity.persistentCount,
       newlyActiveActors: worldState.actorContinuity.newlyActiveCount,
@@ -2692,6 +3134,34 @@ async function readPreviousForecastWorldState(storageConfig) {
   }
 }
 
+// Returns world states ordered most-recent-first (LPUSH prepends, LRANGE 0 N reads from head).
+// Callers that rely on priorMatches[0] being the most recent must not reorder this array.
+async function readForecastWorldStateHistory(storageConfig, limit = WORLD_STATE_HISTORY_LIMIT) {
+  try {
+    const { url, token } = getRedisCredentials();
+    const resp = await redisCommand(url, token, ['LRANGE', TRACE_RUNS_KEY, 0, Math.max(0, limit - 1)]);
+    const rawPointers = Array.isArray(resp?.result) ? resp.result : [];
+    const pointers = rawPointers
+      .map((value) => {
+        try { return JSON.parse(value); } catch { return null; }
+      })
+      .filter((item) => item?.worldStateKey);
+    const seen = new Set();
+    const keys = [];
+    for (const pointer of pointers) {
+      if (seen.has(pointer.worldStateKey)) continue;
+      seen.add(pointer.worldStateKey);
+      keys.push(pointer.worldStateKey);
+      if (keys.length >= limit) break;
+    }
+    const states = await Promise.all(keys.map((key) => getR2JsonObject(storageConfig, key).catch(() => null)));
+    return states.filter(Boolean);
+  } catch (err) {
+    console.warn(`  [Trace] World-state history read failed: ${err.message}`);
+    return [];
+  }
+}
+
 async function writeForecastTraceArtifacts(data, context = {}) {
   const storageConfig = resolveR2StorageConfig();
   if (!storageConfig) return null;
@@ -2699,10 +3169,19 @@ async function writeForecastTraceArtifacts(data, context = {}) {
   const traceCap = getTraceCapLog(predictionCount);
   console.log(`  Trace cap: raw=${traceCap.raw ?? 'default'} resolved=${traceCap.resolved} total=${traceCap.totalForecasts}`);
 
-  const priorWorldState = await readPreviousForecastWorldState(storageConfig);
+  // Keep TRACE_LATEST_KEY as a fallback because writeForecastTracePointer() updates
+  // the latest pointer and history list in separate Redis calls. If SET succeeds
+  // but LPUSH/LTRIM fails or the history list is stale, continuity should still
+  // see the most recent prior world state.
+  const [priorWorldStates, priorWorldStateFallback] = await Promise.all([
+    readForecastWorldStateHistory(storageConfig, WORLD_STATE_HISTORY_LIMIT),
+    readPreviousForecastWorldState(storageConfig),
+  ]);
+  const priorWorldState = priorWorldStates[0] ?? priorWorldStateFallback;
   const artifacts = buildForecastTraceArtifacts({
     ...data,
     priorWorldState,
+    priorWorldStates,
   }, context, {
     basePrefix: storageConfig.basePrefix,
     maxForecasts: getTraceMaxForecasts(predictionCount),
@@ -2739,6 +3218,7 @@ async function writeForecastTraceArtifacts(data, context = {}) {
     worldStateKey: artifacts.worldStateKey,
     forecastCount: artifacts.manifest.forecastCount,
     tracedForecastCount: artifacts.manifest.tracedForecastCount,
+    triggerContext: artifacts.manifest.triggerContext,
     quality: artifacts.summary.quality,
     worldStateSummary: artifacts.summary.worldStateSummary,
   };
@@ -3191,6 +3671,14 @@ function validateScenarios(scenarios, predictions) {
   });
 }
 
+function getEnrichmentFailureReason({ result, raw, scenarios = 0, perspectives = 0, cases = 0 }) {
+  if (!result) return 'call_failed';
+  if (raw == null) return 'parse_failed';
+  if (Array.isArray(raw) && raw.length === 0) return 'empty_output';
+  if ((scenarios + perspectives + cases) === 0) return 'validation_failed';
+  return '';
+}
+
 async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
   const stage = options.stage || 'default';
   const providers = resolveForecastLlmProviders(options);
@@ -3417,6 +3905,8 @@ async function enrichScenariosWithLLM(predictions) {
       scenarios: 0,
       perspectives: 0,
       cases: 0,
+      rawItemCount: 0,
+      failureReason: '',
       succeeded: false,
     },
     scenario: {
@@ -3426,6 +3916,8 @@ async function enrichScenariosWithLLM(predictions) {
       model: '',
       scenarios: 0,
       cases: 0,
+      rawItemCount: 0,
+      failureReason: '',
       succeeded: false,
     },
   };
@@ -3448,6 +3940,7 @@ async function enrichScenariosWithLLM(predictions) {
       enrichmentMeta.combined.scenarios = cached.items.filter(item => item.scenario).length;
       enrichmentMeta.combined.perspectives = cached.items.filter(item => item.strategic || item.regional || item.contrarian).length;
       enrichmentMeta.combined.cases = cached.items.filter(item => item.baseCase || item.escalatoryCase || item.contrarianCase).length;
+      enrichmentMeta.combined.rawItemCount = cached.items.length;
       for (const item of cached.items) {
         if (item.index >= 0 && item.index < topWithPerspectives.length) {
           applyTraceMeta(topWithPerspectives[item.index], {
@@ -3481,10 +3974,18 @@ async function enrichScenariosWithLLM(predictions) {
         enrichmentMeta.combined.source = 'live';
         enrichmentMeta.combined.provider = result.provider;
         enrichmentMeta.combined.model = result.model;
+        enrichmentMeta.combined.rawItemCount = Array.isArray(raw) ? raw.length : 0;
         enrichmentMeta.combined.scenarios = validScenarios.length;
         enrichmentMeta.combined.perspectives = validPerspectives.length;
         enrichmentMeta.combined.cases = validCases.length;
         enrichmentMeta.combined.succeeded = validScenarios.length > 0 || validPerspectives.length > 0 || validCases.length > 0;
+        enrichmentMeta.combined.failureReason = getEnrichmentFailureReason({
+          result,
+          raw,
+          scenarios: validScenarios.length,
+          perspectives: validPerspectives.length,
+          cases: validCases.length,
+        });
 
         for (const s of validScenarios) {
           applyTraceMeta(topWithPerspectives[s.index], {
@@ -3526,12 +4027,15 @@ async function enrichScenariosWithLLM(predictions) {
         console.log(JSON.stringify({
           event: 'llm_combined', provider: result.provider, model: result.model,
           hash, count: topWithPerspectives.length,
+          rawItems: Array.isArray(raw) ? raw.length : 0,
           scenarios: validScenarios.length, perspectives: validPerspectives.length, cases: validCases.length,
+          failureReason: enrichmentMeta.combined.failureReason || '',
           latencyMs: Math.round(Date.now() - t0), cached: false,
         }));
 
         if (items.length > 0) await redisSet(url, token, cacheKey, { items }, 3600);
       } else {
+        enrichmentMeta.combined.failureReason = 'call_failed';
         console.warn('  [LLM:combined] call failed');
       }
     }
@@ -3550,6 +4054,7 @@ async function enrichScenariosWithLLM(predictions) {
       enrichmentMeta.scenario.model = 'cache';
       enrichmentMeta.scenario.scenarios = cached.scenarios.filter(item => item.scenario).length;
       enrichmentMeta.scenario.cases = cached.scenarios.filter(item => item.baseCase || item.escalatoryCase || item.contrarianCase).length;
+      enrichmentMeta.scenario.rawItemCount = cached.scenarios.length;
       for (const s of cached.scenarios) {
         if (s.index >= 0 && s.index < scenarioOnly.length && s.scenario) {
           applyTraceMeta(scenarioOnly[s.index], {
@@ -3581,9 +4086,16 @@ async function enrichScenariosWithLLM(predictions) {
         enrichmentMeta.scenario.source = 'live';
         enrichmentMeta.scenario.provider = result.provider;
         enrichmentMeta.scenario.model = result.model;
+        enrichmentMeta.scenario.rawItemCount = Array.isArray(raw) ? raw.length : 0;
         enrichmentMeta.scenario.scenarios = valid.length;
         enrichmentMeta.scenario.cases = validCases.length;
         enrichmentMeta.scenario.succeeded = valid.length > 0 || validCases.length > 0;
+        enrichmentMeta.scenario.failureReason = getEnrichmentFailureReason({
+          result,
+          raw,
+          scenarios: valid.length,
+          cases: validCases.length,
+        });
         for (const s of valid) {
           applyTraceMeta(scenarioOnly[s.index], {
             narrativeSource: 'llm_scenario',
@@ -3605,7 +4117,8 @@ async function enrichScenariosWithLLM(predictions) {
 
         console.log(JSON.stringify({
           event: 'llm_scenario', provider: result.provider, model: result.model,
-          hash, count: scenarioOnly.length, scenarios: valid.length, cases: validCases.length,
+          hash, count: scenarioOnly.length, rawItems: Array.isArray(raw) ? raw.length : 0, scenarios: valid.length, cases: validCases.length,
+          failureReason: enrichmentMeta.scenario.failureReason || '',
           latencyMs: Math.round(Date.now() - t0), cached: false,
         }));
 
@@ -3636,6 +4149,7 @@ async function enrichScenariosWithLLM(predictions) {
           await redisSet(url, token, cacheKey, { scenarios }, 3600);
         }
       } else {
+        enrichmentMeta.scenario.failureReason = 'call_failed';
         console.warn('  [LLM:scenario] call failed');
       }
     }
@@ -3696,12 +4210,85 @@ async function fetchForecasts() {
   return { predictions: publishedPredictions, generatedAt: Date.now(), enrichmentMeta };
 }
 
+async function readForecastRefreshRequest() {
+  try {
+    const { url, token } = getRedisCredentials();
+    const request = await redisGet(url, token, FORECAST_REFRESH_REQUEST_KEY);
+    return request && typeof request === 'object' ? request : null;
+  } catch (err) {
+    console.warn(`  [Trigger] Refresh request read failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function clearForecastRefreshRequest() {
+  try {
+    const { url, token } = getRedisCredentials();
+    await redisDel(url, token, FORECAST_REFRESH_REQUEST_KEY);
+  } catch (err) {
+    console.warn(`  [Trigger] Refresh request clear failed: ${err.message}`);
+  }
+}
+
+function sameForecastRefreshRequest(left, right) {
+  if (!left || !right) return false;
+  return (left.requestedAt || 0) === (right.requestedAt || 0)
+    && (left.requester || '') === (right.requester || '')
+    && (left.requesterRunId || '') === (right.requesterRunId || '')
+    && (left.sourceVersion || '') === (right.sourceVersion || '');
+}
+
+async function clearForecastRefreshRequestIfUnchanged(consumedRequest) {
+  if (!consumedRequest) return;
+  try {
+    const current = await readForecastRefreshRequest();
+    if (!sameForecastRefreshRequest(current, consumedRequest)) {
+      console.log('  [Trigger] Leaving newer refresh request queued');
+      return;
+    }
+    await clearForecastRefreshRequest();
+  } catch (err) {
+    console.warn(`  [Trigger] Conditional refresh request clear failed: ${err.message}`);
+  }
+}
+
+function buildForecastTriggerContext(request = null) {
+  const triggerSource = request?.requestedBy || 'forecast_cron';
+  return {
+    triggerSource,
+    triggerRequest: request
+      ? {
+          requestedAt: request.requestedAt || 0,
+          requestedAtIso: request.requestedAtIso || '',
+          requester: request.requester || '',
+          requesterRunId: request.requesterRunId || '',
+          sourceVersion: request.sourceVersion || '',
+        }
+      : null,
+    triggerService: 'seed-forecasts',
+    deployRevision: getDeployRevision(),
+  };
+}
+
 if (_isDirectRun) {
-  await runSeed('forecast', 'predictions', CANONICAL_KEY, fetchForecasts, {
+  const refreshRequest = await readForecastRefreshRequest();
+  const triggerContext = buildForecastTriggerContext(refreshRequest);
+  console.log(`  [Trigger] source=${triggerContext.triggerSource}${triggerContext.triggerRequest?.requester ? ` requester=${triggerContext.triggerRequest.requester}` : ''}`);
+
+  await runSeed('forecast', 'predictions', CANONICAL_KEY, async () => {
+    const data = await fetchForecasts();
+    return {
+      ...data,
+      triggerContext,
+    };
+  }, {
     ttlSeconds: TTL_SECONDS,
     lockTtlMs: 180_000,
     validateFn: (data) => Array.isArray(data?.predictions) && data.predictions.length > 0,
     afterPublish: async (data, meta) => {
+      if (triggerContext.triggerRequest) {
+        await clearForecastRefreshRequestIfUnchanged(triggerContext.triggerRequest);
+      }
       try {
         const snapshot = await appendHistorySnapshot(data);
         console.log(`  History appended: ${snapshot.predictions.length} forecasts -> ${HISTORY_KEY}`);

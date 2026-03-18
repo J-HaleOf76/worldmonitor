@@ -38,6 +38,8 @@ const MILITARY_CLASSIFICATION_AUDIT_STALE_KEY = 'military:classification-audit:s
 const MILITARY_CLASSIFICATION_AUDIT_LIVE_TTL = 900;
 const MILITARY_CLASSIFICATION_AUDIT_STALE_TTL = 86400;
 const CHAIN_FORECAST_SEED = process.env.CHAIN_FORECAST_SEED_ON_MILITARY === '1';
+const FORECAST_REFRESH_REQUEST_KEY = 'forecast:refresh-request:v1';
+const FORECAST_REFRESH_REQUEST_TTL = 60 * 60;
 
 // ── Proxy Config ─────────────────────────────────────────
 const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.OREF_PROXY_AUTH || '';
@@ -1244,7 +1246,7 @@ async function fetchMilitaryVesselsFromRelay() {
     });
     if (!resp.ok) {
       console.warn(`  Military vessels: relay HTTP ${resp.status}`);
-      return [];
+      return null;
     }
     const data = await resp.json();
     if (!Array.isArray(data?.vessels)) return [];
@@ -1260,7 +1262,7 @@ async function fetchMilitaryVesselsFromRelay() {
       }));
   } catch (err) {
     console.warn(`  Military vessels: relay fetch failed (${err.message || err})`);
-    return [];
+    return null;
   }
 }
 
@@ -1278,7 +1280,7 @@ async function fetchCiiScores() {
     });
     if (!resp.ok) {
       console.warn(`  CII scores: API HTTP ${resp.status}`);
-      return {};
+      return null;
     }
     const data = await resp.json();
     if (!Array.isArray(data?.ciiScores)) return {};
@@ -1289,12 +1291,24 @@ async function fetchCiiScores() {
     );
   } catch (err) {
     console.warn(`  CII scores: fetch failed (${err.message || err})`);
-    return {};
+    return null;
   }
 }
 
-async function triggerForecastSeedIfEnabled() {
+async function requestForecastRefreshIfEnabled(runId, assessedAt, source) {
   if (!CHAIN_FORECAST_SEED) return;
+
+  const { url, token } = getRedisCredentials();
+  const request = {
+    requestedAt: assessedAt,
+    requestedAtIso: new Date(assessedAt).toISOString(),
+    requestedBy: 'military_chain',
+    requester: 'seed-military-flights',
+    requesterRunId: runId,
+    sourceVersion: source || '',
+  };
+  await redisSet(url, token, FORECAST_REFRESH_REQUEST_KEY, request, FORECAST_REFRESH_REQUEST_TTL);
+  console.log('  Forecast refresh requested after military publish');
 
   const scriptPath = fileURLToPath(new URL('./seed-forecasts.mjs', import.meta.url));
   console.log('  Triggering forecast reseed after military publish...');
@@ -1407,18 +1421,25 @@ async function main() {
       altitude: f.altitude || 0, heading: f.heading || 0, speed: f.speed || 0,
       aircraftType: f.aircraftType || detectAircraftType(f.callsign),
     }));
-    const [militaryVessels, ciiScores] = await Promise.all([
+    const [militaryVesselsResult, ciiScoresResult] = await Promise.all([
       fetchMilitaryVesselsFromRelay(),
       fetchCiiScores(),
     ]);
+    const auxiliaryOk = militaryVesselsResult !== null && ciiScoresResult !== null;
+    const militaryVessels = militaryVesselsResult ?? [];
+    const ciiScores = ciiScoresResult ?? {};
     const theaters = calculateTheaterPostures(theaterFlights, militaryVessels, assessedAt, ciiScores);
-    const posturePayload = { theaters };
-    await redisSet(url, token, THEATER_POSTURE_LIVE_KEY, posturePayload, THEATER_POSTURE_LIVE_TTL);
-    await redisSet(url, token, THEATER_POSTURE_STALE_KEY, posturePayload, THEATER_POSTURE_STALE_TTL);
-    await redisSet(url, token, THEATER_POSTURE_BACKUP_KEY, posturePayload, THEATER_POSTURE_BACKUP_TTL);
-    await redisSet(url, token, 'seed-meta:theater-posture', { fetchedAt: assessedAt, recordCount: theaterFlights.length + militaryVessels.length, sourceVersion: source || '' }, 604800);
-    const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
-    console.log(`  Theater posture: ${theaters.length} theaters (${elevated} elevated, ${militaryVessels.length} vessels)`);
+    if (auxiliaryOk) {
+      const posturePayload = { theaters };
+      await redisSet(url, token, THEATER_POSTURE_LIVE_KEY, posturePayload, THEATER_POSTURE_LIVE_TTL);
+      await redisSet(url, token, THEATER_POSTURE_STALE_KEY, posturePayload, THEATER_POSTURE_STALE_TTL);
+      await redisSet(url, token, THEATER_POSTURE_BACKUP_KEY, posturePayload, THEATER_POSTURE_BACKUP_TTL);
+      await redisSet(url, token, 'seed-meta:theater-posture', { fetchedAt: assessedAt, recordCount: theaterFlights.length + militaryVessels.length, sourceVersion: source || '' }, 604800);
+      const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
+      console.log(`  Theater posture: ${theaters.length} theaters (${elevated} elevated, ${militaryVessels.length} vessels)`);
+    } else {
+      console.warn('  Theater posture: skipping posture-key write — auxiliary fetch failed (stale data preserved)');
+    }
 
     const priorSurgeHistory = ((await redisGet(url, token, MILITARY_SURGES_HISTORY_KEY))?.history || []);
     const theaterActivity = summarizeMilitaryTheaters(flights, POSTURE_THEATERS, assessedAt);
@@ -1465,7 +1486,7 @@ async function main() {
     await releaseLock('military:flights', runId);
     lockReleased = true;
     try {
-      await triggerForecastSeedIfEnabled();
+      await requestForecastRefreshIfEnabled(runId, assessedAt, source);
     } catch (err) {
       console.warn(`  Forecast reseed failed after military publish: ${err.message || err}`);
     }
