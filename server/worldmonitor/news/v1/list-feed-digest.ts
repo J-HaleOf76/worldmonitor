@@ -6,7 +6,8 @@ import type {
   NewsItem as ProtoNewsItem,
   ThreatLevel as ProtoThreatLevel,
 } from '../../../../src/generated/server/worldmonitor/news/v1/service_server';
-import { cachedFetchJson, getCachedJsonBatch } from '../../../_shared/redis';
+import { cachedFetchJson, getCachedJson, setCachedJson, getCachedJsonBatch } from '../../../_shared/redis';
+import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { sha256Hex } from '../../../_shared/hash';
 import { CHROME_UA } from '../../../_shared/constants';
 import { VARIANT_FEEDS, INTEL_SOURCES, type ServerFeed } from './_feeds';
@@ -271,26 +272,44 @@ function toProtoItem(item: ParsedItem): ProtoNewsItem {
 }
 
 export async function listFeedDigest(
-  _ctx: ServerContext,
+  ctx: ServerContext,
   req: ListFeedDigestRequest,
 ): Promise<ListFeedDigestResponse> {
   const variant = VALID_VARIANTS.has(req.variant) ? req.variant : 'full';
   const lang = req.lang || 'en';
 
   const digestCacheKey = `news:digest:v1:${variant}:${lang}`;
-
   const fallbackKey = `${variant}:${lang}`;
+
+  const empty = (): ListFeedDigestResponse => ({ categories: {}, feedStatuses: {}, generatedAt: new Date().toISOString() });
+
   try {
-    const cached = await cachedFetchJson<ListFeedDigestResponse>(digestCacheKey, 3600, async () => {
-      return buildDigest(variant, lang);
-    });
+    // Check Redis first — warm path returns immediately
+    const cached = await getCachedJson(digestCacheKey) as ListFeedDigestResponse | null;
     if (cached) {
       if (fallbackDigestCache.size > 50) fallbackDigestCache.clear();
       fallbackDigestCache.set(fallbackKey, { data: cached, ts: Date.now() });
+      return cached;
     }
-    return cached ?? fallbackDigestCache.get(fallbackKey)?.data ?? { categories: {}, feedStatuses: {}, generatedAt: new Date().toISOString() };
+
+    // Cold path — build fresh digest
+    const fresh = await buildDigest(variant, lang);
+    const totalItems = Object.values(fresh.categories).reduce((sum, b) => sum + b.items.length, 0);
+
+    if (totalItems > 0) {
+      // Good response: cache in Redis and update in-memory fallback
+      await setCachedJson(digestCacheKey, fresh, 900);
+      if (fallbackDigestCache.size > 50) fallbackDigestCache.clear();
+      fallbackDigestCache.set(fallbackKey, { data: fresh, ts: Date.now() });
+    } else {
+      // Degraded response: skip Redis write; prevent gateway/CDN from caching
+      markNoCacheResponse(ctx.request);
+    }
+
+    return fresh;
   } catch {
-    return fallbackDigestCache.get(fallbackKey)?.data ?? { categories: {}, feedStatuses: {}, generatedAt: new Date().toISOString() };
+    markNoCacheResponse(ctx.request);
+    return fallbackDigestCache.get(fallbackKey)?.data ?? empty();
   }
 }
 
