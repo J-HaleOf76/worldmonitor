@@ -51,6 +51,7 @@ import {
   computeAnalysisPriority,
   rankForecastsForAnalysis,
   selectPublishedForecastPool,
+  buildPublishedForecastArtifacts,
   filterPublishedForecasts,
   applySituationFamilyCaps,
   selectForecastsForEnrichment,
@@ -2046,9 +2047,66 @@ describe('forecast quality gating', () => {
     assert.ok(selected.some((pred) => pred.familyContext?.id === familyA.id));
     assert.ok(selected.some((pred) => pred.familyContext?.id === familyB.id));
     assert.ok(selected.some((pred) => pred.domain === 'market'));
+    assert.ok((selected.deferredCandidates || []).length >= 1);
+  });
 
-    const telemetry = summarizePublishFiltering(preds);
-    assert.ok(telemetry.suppressedFamilySelection >= 1);
+  it('backfills deferred forecasts when filtering drops a preselected duplicate', () => {
+    const primary = makePrediction('conflict', 'Iran', 'Escalation risk: Iran', 0.74, 0.66, '7d', [{ type: 'ucdp', value: 'Iran events elevated', weight: 0.4 }]);
+    const duplicate = makePrediction('conflict', 'Iran', 'Retaliatory conflict risk: Iran', 0.69, 0.58, '7d', [{ type: 'ucdp', value: 'Iran events elevated', weight: 0.36 }]);
+    const political = makePrediction('political', 'Iran', 'Political instability: Iran', 0.59, 0.57, '14d', [{ type: 'news_corroboration', value: 'Emergency cabinet meetings continue', weight: 0.35 }]);
+    const supply = makePrediction('supply_chain', 'Persian Gulf', 'Shipping disruption: Persian Gulf', 0.54, 0.56, '14d', [{ type: 'chokepoint', value: 'Routing delays persist', weight: 0.34 }]);
+
+    buildForecastCases([primary, duplicate, political, supply]);
+    const fullRunSituationClusters = [
+      { id: 'sit-iran-conflict', label: 'Iran conflict situation', dominantRegion: 'Iran', dominantDomain: 'conflict', regions: ['Iran'], domains: ['conflict'], actors: ['Iran'], branchKinds: ['base'], forecastIds: [primary.id, duplicate.id], forecastCount: 2, avgProbability: 0.715, avgConfidence: 0.62, topSignals: [{ type: 'ucdp', count: 2 }], sampleTitles: [primary.title, duplicate.title] },
+      { id: 'sit-iran-political', label: 'Iran political situation', dominantRegion: 'Iran', dominantDomain: 'political', regions: ['Iran'], domains: ['political'], actors: ['Iran'], branchKinds: ['base'], forecastIds: [political.id], forecastCount: 1, avgProbability: 0.59, avgConfidence: 0.57, topSignals: [{ type: 'news_corroboration', count: 1 }], sampleTitles: [political.title] },
+      { id: 'sit-gulf-shipping', label: 'Persian Gulf shipping situation', dominantRegion: 'Persian Gulf', dominantDomain: 'supply_chain', regions: ['Persian Gulf'], domains: ['supply_chain'], actors: ['Shipping'], branchKinds: ['base'], forecastIds: [supply.id], forecastCount: 1, avgProbability: 0.54, avgConfidence: 0.56, topSignals: [{ type: 'chokepoint', count: 1 }], sampleTitles: [supply.title] },
+    ];
+
+    const familyA = { id: 'fam-middle-east', label: 'Middle East pressure family', forecastCount: 3, situationCount: 2, situationIds: ['sit-iran-conflict', 'sit-iran-political'] };
+    const familyB = { id: 'fam-gulf', label: 'Persian Gulf pressure family', forecastCount: 1, situationCount: 1, situationIds: ['sit-gulf-shipping'] };
+    for (const pred of [primary, duplicate, political, supply]) {
+      pred.traceMeta = { narrativeSource: 'fallback' };
+      pred.readiness = { overall: 0.7 };
+    }
+    primary.analysisPriority = 0.25;
+    duplicate.analysisPriority = 0.2;
+    political.analysisPriority = 0.18;
+    supply.analysisPriority = 0.14;
+
+    primary.situationContext = fullRunSituationClusters[0];
+    duplicate.situationContext = fullRunSituationClusters[0];
+    political.situationContext = fullRunSituationClusters[1];
+    supply.situationContext = fullRunSituationClusters[2];
+    primary.caseFile.situationContext = primary.situationContext;
+    duplicate.caseFile.situationContext = duplicate.situationContext;
+    political.caseFile.situationContext = political.situationContext;
+    supply.caseFile.situationContext = supply.situationContext;
+    primary.familyContext = familyA;
+    duplicate.familyContext = familyA;
+    political.familyContext = familyA;
+    supply.familyContext = familyB;
+    primary.caseFile.familyContext = familyA;
+    duplicate.caseFile.familyContext = familyA;
+    political.caseFile.familyContext = familyA;
+    supply.caseFile.familyContext = familyB;
+
+    const pool = selectPublishedForecastPool([primary, duplicate, political], { targetCount: 3 });
+    assert.equal(pool.length, 3);
+    assert.equal(pool.deferredCandidates.length, 0);
+
+    const expandedPool = selectPublishedForecastPool([primary, duplicate, political, supply], { targetCount: 3 });
+    let candidatePool = [...expandedPool];
+    let deferred = [...expandedPool.deferredCandidates];
+    let artifacts = buildPublishedForecastArtifacts(candidatePool, fullRunSituationClusters);
+    while (artifacts.publishedPredictions.length < expandedPool.targetCount && deferred.length > 0) {
+      candidatePool.push(deferred.shift());
+      artifacts = buildPublishedForecastArtifacts(candidatePool, fullRunSituationClusters);
+    }
+
+    assert.equal(artifacts.publishedPredictions.length, 3);
+    assert.ok(artifacts.publishedPredictions.some((pred) => pred.id === supply.id));
+    assert.ok(!artifacts.publishedPredictions.some((pred) => pred.id === duplicate.id));
   });
 
   it('does not report capped situations when a situation only reaches the cap without dropping anything', () => {

@@ -4703,25 +4703,54 @@ function selectPublishedForecastPool(predictions, options = {}) {
     if (canSelect(pred, 'fill')) take(pred);
   }
 
-  for (const pred of eligible) {
-    if (selectedIds.has(pred.id)) continue;
-    pred.publishDiagnostics = {
-      reason: 'family_selection',
-      familyId: pred.familyContext?.id || '',
-      situationId: pred.situationContext?.id || '',
-      targetCount,
-    };
+  const deferredCandidates = ranked.filter((pred) => !selectedIds.has(pred.id));
+  if (deferredCandidates.length > 0) {
+    console.log(`  [filterPublished] Deferred ${deferredCandidates.length} forecast(s) in family selection`);
   }
 
-  if ((eligible.length - selected.length) > 0) {
-    console.log(`  [filterPublished] Deferred ${eligible.length - selected.length} forecast(s) in family selection`);
-  }
-
-  return selected
+  const result = selected
     .slice()
     .sort((a, b) => (b.analysisPriority || 0) - (a.analysisPriority || 0)
       || (b.publishSelectionScore || 0) - (a.publishSelectionScore || 0)
       || (b.probability || 0) - (a.probability || 0));
+  result.deferredCandidates = deferredCandidates;
+  result.targetCount = targetCount;
+  return result;
+}
+
+function buildPublishedForecastArtifacts(candidatePool, fullRunSituationClusters) {
+  const filteredPredictions = filterPublishedForecasts(candidatePool);
+  const filteredSituationClusters = projectSituationClusters(fullRunSituationClusters, filteredPredictions);
+  attachSituationContext(filteredPredictions, filteredSituationClusters);
+  const filteredSituationFamilies = attachSituationFamilyContext(filteredPredictions, buildSituationFamilies(filteredSituationClusters));
+  const publishedPredictions = applySituationFamilyCaps(filteredPredictions, filteredSituationFamilies);
+  const publishedSituationClusters = projectSituationClusters(fullRunSituationClusters, publishedPredictions);
+  attachSituationContext(publishedPredictions, publishedSituationClusters);
+  const publishedSituationFamilies = attachSituationFamilyContext(publishedPredictions, buildSituationFamilies(publishedSituationClusters));
+  refreshPublishedNarratives(publishedPredictions);
+  return {
+    filteredPredictions,
+    filteredSituationClusters,
+    filteredSituationFamilies,
+    publishedPredictions,
+    publishedSituationClusters,
+    publishedSituationFamilies,
+  };
+}
+
+function markDeferredFamilySelection(predictions, selectedPool) {
+  const selectedIds = new Set((selectedPool || []).map((pred) => pred.id));
+  for (const pred of predictions || []) {
+    if ((pred?.probability || 0) <= PUBLISH_MIN_PROBABILITY) continue;
+    if (selectedIds.has(pred.id)) continue;
+    if (pred.publishDiagnostics?.reason) continue;
+    pred.publishDiagnostics = {
+      reason: 'family_selection',
+      familyId: pred.familyContext?.id || '',
+      situationId: pred.situationContext?.id || '',
+      targetCount: selectedPool?.targetCount || 0,
+    };
+  }
 }
 
 function filterPublishedForecasts(predictions, minProbability = PUBLISH_MIN_PROBABILITY) {
@@ -5727,16 +5756,22 @@ async function fetchForecasts() {
   populateFallbackNarratives(predictions);
 
   const publishSelectionPool = selectPublishedForecastPool(predictions);
-  const initiallyPublishedPredictions = filterPublishedForecasts(publishSelectionPool);
-  const initiallyPublishedSituationClusters = projectSituationClusters(fullRunSituationClusters, initiallyPublishedPredictions);
-  attachSituationContext(initiallyPublishedPredictions, initiallyPublishedSituationClusters);
-  const initiallyPublishedSituationFamilies = attachSituationFamilyContext(initiallyPublishedPredictions, buildSituationFamilies(initiallyPublishedSituationClusters));
-  const publishedPredictions = applySituationFamilyCaps(initiallyPublishedPredictions, initiallyPublishedSituationFamilies);
+  let finalSelectionPool = [...publishSelectionPool];
+  finalSelectionPool.targetCount = publishSelectionPool.targetCount || finalSelectionPool.length;
+  const deferredCandidates = [...(publishSelectionPool.deferredCandidates || [])];
+  let publishArtifacts = buildPublishedForecastArtifacts(finalSelectionPool, fullRunSituationClusters);
+  while (publishArtifacts.publishedPredictions.length < (finalSelectionPool.targetCount || 0) && deferredCandidates.length > 0) {
+    finalSelectionPool.push(deferredCandidates.shift());
+    publishArtifacts = buildPublishedForecastArtifacts(finalSelectionPool, fullRunSituationClusters);
+  }
+  markDeferredFamilySelection(predictions, finalSelectionPool);
+  const initiallyPublishedPredictions = publishArtifacts.filteredPredictions;
+  const initiallyPublishedSituationClusters = publishArtifacts.filteredSituationClusters;
+  const initiallyPublishedSituationFamilies = publishArtifacts.filteredSituationFamilies;
+  const publishedPredictions = publishArtifacts.publishedPredictions;
   const publishTelemetry = summarizePublishFiltering(predictions);
-  const publishedSituationClusters = projectSituationClusters(fullRunSituationClusters, publishedPredictions);
-  attachSituationContext(publishedPredictions, publishedSituationClusters);
-  const publishedSituationFamilies = attachSituationFamilyContext(publishedPredictions, buildSituationFamilies(publishedSituationClusters));
-  refreshPublishedNarratives(publishedPredictions);
+  const publishedSituationClusters = publishArtifacts.publishedSituationClusters;
+  const publishedSituationFamilies = publishArtifacts.publishedSituationFamilies;
   if (publishedPredictions.length !== predictions.length) {
     console.log(`  Filtered ${predictions.length - publishedPredictions.length} forecasts at publish floor > ${PUBLISH_MIN_PROBABILITY}`);
   }
@@ -5924,6 +5959,7 @@ export {
   computeAnalysisPriority,
   rankForecastsForAnalysis,
   selectPublishedForecastPool,
+  buildPublishedForecastArtifacts,
   filterPublishedForecasts,
   applySituationFamilyCaps,
   summarizePublishFiltering,
