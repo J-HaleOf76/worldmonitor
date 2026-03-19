@@ -76,7 +76,8 @@ async function fetchWithRetry(topic, maxRetries = 3) {
       const is429 = err.message?.includes('429');
       if (!is429 || attempt === maxRetries) {
         console.warn(`    ${topic.id}: giving up after ${attempt + 1} attempts (${err.message})`);
-        return { id: topic.id, articles: [], fetchedAt: new Date().toISOString(), exhausted: true };
+        // exhausted:true only when 429 was the reason — post-exhaust cooldown is only relevant for rate-limit windows
+        return { id: topic.id, articles: [], fetchedAt: new Date().toISOString(), exhausted: is429 };
       }
       // Exponential backoff: 60s, 120s, 240s — GDELT rate limit windows exceed 50s
       const backoff = 60_000 * Math.pow(2, attempt);
