@@ -1,4 +1,4 @@
-import { query, mutation } from "./_generated/server";
+import { query, internalMutation } from "./_generated/server";
 import { v } from "convex/values";
 
 /**
@@ -18,10 +18,11 @@ export const getUserRole = query({
 });
 
 /**
- * Set (upsert) the role for a user. Admin-only in practice --
- * called from Convex dashboard or admin scripts, not from the client.
+ * Set (upsert) the role for a user.
+ * Internal-only: callable from Convex actions/mutations via runMutation,
+ * NOT directly from any client. This prevents privilege escalation.
  */
-export const setUserRole = mutation({
+export const setUserRole = internalMutation({
   args: {
     userId: v.string(),
     role: v.string(),
